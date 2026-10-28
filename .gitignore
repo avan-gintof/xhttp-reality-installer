@@ -1,0 +1,11 @@
+# Ignore sensitive server credentials and local scripts
+ssh_check.ps1
+askpass.*
+render.ps1
+*.png
+*.html
+*.log
+*.tmp
+*.py
+scratch/
+.system_generated/
