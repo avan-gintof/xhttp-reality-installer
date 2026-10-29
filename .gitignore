@@ -7,5 +7,6 @@ render.ps1
 *.log
 *.tmp
 *.py
+deploy/
 scratch/
 .system_generated/

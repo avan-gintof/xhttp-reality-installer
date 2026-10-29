@@ -5,14 +5,17 @@
 # - Nginx Stream (L4 SNI Pre-read Multiplexer on port 443)
 # - Inbound 1: VLESS + TCP + XTLS-Vision + Reality (127.0.0.2:443, SNI: gateway.icloud.com) -> Ultra Speed
 # - Inbound 2: VLESS + XHTTP + Reality (127.0.0.3:443, SNI: www.apple.com) -> Anti-DPI / HTTP-Streams
-# - Caddy Web Server on internal 8444 with strict_sni_host (RFC 421) & Auto-HTTPS
+# - Caddy Web Server on internal 8444 with strict_sni_host (RFC 421), admin off & Auto-HTTPS
+# - Search Engine Protection: X-Robots-Tag (noindex, nofollow) + virtual /robots.txt
 # - Nginx HTTP on port 80 (anti-probing: return 444 on raw IP, ACME pass to Caddy)
 # - Modern Responsive Showcase Landing Page for Domain 1
 # - Zero public port exposure: 3x-ui bound strictly to localhost + secret sub paths
 # - BBR TCP Congestion Control + FQ qdisc + IP Forwarding enabled
 # - Anti-DPI Mobile bypass: fp=firefox preset (MTS/TSPU bypass)
 # - Comprehensive Routing Protection: BitTorrent block, RU/SU blackholing (DMCA & IP shield)
-# - Hardened UFW Firewall (only SSH, 80, 443 allowed) + Fail2ban
+# - Hardened Security: CrowdSec IDS + Firewall Bouncer + Fail2ban + UFW
+# - SSH Hardening: custom port, X11Forwarding disabled, socket/service auto-reload
+# - Hardened Log Permissions: Xray logs restricted to root:xui (660, no world access)
 # ==============================================================================
 
 set -e
@@ -47,30 +50,48 @@ echo -e "${PURPLE}==============================================================
 echo -e "${BOLD} Установка Stealth Node v2.0 (Dual VLESS TCP+XHTTP + Apple SNI) ${NC}"
 echo -e "${PURPLE}================================================================${NC}\n"
 
-# Detect Server IP
-SERVER_IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org || curl -s4 --connect-timeout 5 https://ifconfig.me || echo "YOUR_SERVER_IP")
+# Detect Server IP (with multiple reliable fallbacks)
+SERVER_IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org || \
+            curl -s4 --connect-timeout 5 https://ifconfig.me || \
+            curl -s4 --connect-timeout 5 https://icanhazip.com || \
+            ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || \
+            echo "YOUR_SERVER_IP")
 
-# --- Interactive Prompts ---
+# --- Interactive Prompts with Input Sanitization ---
 echo -e "${YELLOW}[?] Введите параметры конфигурации сервера:${NC}\n"
 
-read -rp "$(echo -e "${CYAN}1. Домен для белого веб-сайта (например, site.domain.com): ${NC}")" DOMAIN_WEB
+# Domain 1 (Website Showcase)
+read -rp "$(echo -e "${CYAN}1. Домен для белого веб-сайта (например, site.domain.com): ${NC}")" DOMAIN_WEB_RAW
+DOMAIN_WEB=$(echo "$DOMAIN_WEB_RAW" | sed -e 's|^https\?://||' -e 's|/.*$||' | tr '[:upper:]' '[:lower:]' | xargs)
 while [[ -z "$DOMAIN_WEB" ]]; do
-    read -rp "$(echo -e "${RED}Домен не может быть пустым. Введите домен для сайта: ${NC}")" DOMAIN_WEB
+    read -rp "$(echo -e "${RED}Домен не может быть пустым. Введите домен для сайта: ${NC}")" DOMAIN_WEB_RAW
+    DOMAIN_WEB=$(echo "$DOMAIN_WEB_RAW" | sed -e 's|^https\?://||' -e 's|/.*$||' | tr '[:upper:]' '[:lower:]' | xargs)
 done
 
-read -rp "$(echo -e "${CYAN}2. Домен для панели 3x-ui и подписок (например, sub.domain.com): ${NC}")" DOMAIN_PANEL
+# Domain 2 (Panel & Subscriptions)
+read -rp "$(echo -e "${CYAN}2. Домен для панели 3x-ui и подписок (например, sub.domain.com): ${NC}")" DOMAIN_PANEL_RAW
+DOMAIN_PANEL=$(echo "$DOMAIN_PANEL_RAW" | sed -e 's|^https\?://||' -e 's|/.*$||' | tr '[:upper:]' '[:lower:]' | xargs)
 while [[ -z "$DOMAIN_PANEL" || "$DOMAIN_PANEL" == "$DOMAIN_WEB" ]]; do
-    read -rp "$(echo -e "${RED}Введите уникальный второй домен для панели/подписок: ${NC}")" DOMAIN_PANEL
+    read -rp "$(echo -e "${RED}Введите уникальный второй домен для панели/подписок (отличный от первого): ${NC}")" DOMAIN_PANEL_RAW
+    DOMAIN_PANEL=$(echo "$DOMAIN_PANEL_RAW" | sed -e 's|^https\?://||' -e 's|/.*$||' | tr '[:upper:]' '[:lower:]' | xargs)
 done
 
+# SSH Port
 DEFAULT_SSH_PORT=22
 read -rp "$(echo -e "${CYAN}3. Порт для SSH [по умолчанию: ${DEFAULT_SSH_PORT}]: ${NC}")" SSH_PORT
 SSH_PORT=${SSH_PORT:-$DEFAULT_SSH_PORT}
+# Validate numeric port range
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
+    echo -e "${YELLOW}[!] Некорректный номер порта, установлен дефолтный 22.${NC}"
+    SSH_PORT=22
+fi
 
+# Admin Username
 DEFAULT_ADMIN_USER="admin_$(openssl rand -hex 3)"
 read -rp "$(echo -e "${CYAN}4. Логин администратора 3x-ui [по умолчанию: ${DEFAULT_ADMIN_USER}]: ${NC}")" ADMIN_USER
 ADMIN_USER=${ADMIN_USER:-$DEFAULT_ADMIN_USER}
 
+# Admin Password
 DEFAULT_ADMIN_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)
 read -rp "$(echo -e "${CYAN}5. Пароль администратора 3x-ui [по умолчанию: ${DEFAULT_ADMIN_PASS}]: ${NC}")" ADMIN_PASS
 ADMIN_PASS=${ADMIN_PASS:-$DEFAULT_ADMIN_PASS}
@@ -90,18 +111,18 @@ SECRET_BASE_PATH="/panel_${RAND_PANEL}/"
 SECRET_SUB_PATH="sub_${RAND_SUB}"
 XHTTP_PATH="/xhttp-${RAND_XHTTP}"
 
-CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
+CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
 CLIENT_SHORT_ID=$(openssl rand -hex 8)
 
 echo -e "\n${GREEN}[+] Параметры приняты. Начинаем установку и оптимизацию системы...${NC}\n"
-sleep 2
+sleep 1
 
 # 1. Update system, upgrade packages & setup auto-updates
-echo -e "${BLUE}[1/9] Обновление системы и настройка автообновлений безопасности...${NC}"
+echo -e "${BLUE}[1/10] Обновление системы и установка пакетов...${NC}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y unattended-upgrades update-notifier-common curl wget git ufw fail2ban sqlite3 openssl jq nginx libnginx-mod-stream debian-keyring debian-archive-keyring apt-transport-https iptables netfilter-persistent
+apt-get install -y unattended-upgrades update-notifier-common curl wget git ufw fail2ban sqlite3 openssl jq python3 nginx libnginx-mod-stream debian-keyring debian-archive-keyring apt-transport-https iptables netfilter-persistent qrencode || true
 
 # Enable unattended security upgrades
 cat << 'AUTOUPEOF' > /etc/apt/apt.conf.d/20auto-upgrades
@@ -112,7 +133,7 @@ AUTOUPEOF
 systemctl restart unattended-upgrades >/dev/null 2>&1 || true
 
 # 2. Kernel Acceleration (BBR, FQ & IP Forward)
-echo -e "${BLUE}[2/9] Активация BBR TCP Congestion Control и оптимизация сетевого стека...${NC}"
+echo -e "${BLUE}[2/10] Активация BBR TCP Congestion Control и оптимизация сетевого стека...${NC}"
 cat << 'SYSCTLEOF' > /etc/sysctl.d/99-stealth-node.conf
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -125,8 +146,16 @@ net.ipv4.tcp_wmem = 4096 65536 67108864
 SYSCTLEOF
 sysctl --system >/dev/null 2>&1 || true
 
+# Stop and disable conflicting web servers (like default apache2 on LAMP VPS images)
+if systemctl is-active apache2 &>/dev/null || systemctl is-enabled apache2 &>/dev/null; then
+    echo -e "${YELLOW}[!] Обнаружен активный Apache2. Отключаем для освобождения портов 80 и 443...${NC}"
+    systemctl stop apache2 >/dev/null 2>&1 || true
+    systemctl disable apache2 >/dev/null 2>&1 || true
+fi
+
 # 3. Install official Caddy
-echo -e "${BLUE}[3/9] Установка Caddy веб-сервера...${NC}"
+echo -e "${BLUE}[3/10] Установка Caddy веб-сервера...${NC}"
+mkdir -p /usr/share/keyrings
 if ! command -v caddy &>/dev/null; then
     curl -1sLF 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes
     curl -1sLF 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
@@ -134,22 +163,48 @@ if ! command -v caddy &>/dev/null; then
     apt-get install -y caddy
 fi
 
-# 4. Install 3x-ui
-echo -e "${BLUE}[4/9] Установка 3x-ui (последняя стабильная версия)...${NC}"
-if [[ ! -d "/usr/local/x-ui" ]]; then
-    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) << EOF
-n
-EOF
+# 4. Install CrowdSec & Firewall Bouncer
+echo -e "${BLUE}[4/10] Установка CrowdSec IDS и Firewall Bouncer...${NC}"
+if ! command -v cscli &>/dev/null; then
+    (curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash) || true
+    apt-get update -y || true
+    apt-get install -y crowdsec crowdsec-firewall-bouncer-iptables || true
 fi
 
-systemctl stop x-ui || true
+# 5. Install 3x-ui
+echo -e "${BLUE}[5/10] Установка 3x-ui (последняя версия)...${NC}"
+if [[ ! -d "/usr/local/x-ui" ]]; then
+    export XUI_NONINTERACTIVE=1
+    export XUI_DB_TYPE="sqlite"
+    export XUI_SSL_MODE="none"
+    export XUI_BIN_FOLDER="/usr/local/x-ui"
+    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+fi
 
-# Fix permissions
-chown -R xui:xui /usr/local/x-ui /etc/x-ui 2>/dev/null || true
+# Ensure 3x-ui service runs briefly to initialize the database
+systemctl start x-ui >/dev/null 2>&1 || true
+sleep 2
+systemctl stop x-ui >/dev/null 2>&1 || true
+
+# Detect xui user/group or fallback to root
+XUI_USER="root"
+XUI_GROUP="root"
+if id -u xui &>/dev/null; then
+    XUI_USER="xui"
+    XUI_GROUP="xui"
+fi
+
+chown -R ${XUI_USER}:${XUI_GROUP} /usr/local/x-ui /etc/x-ui 2>/dev/null || true
 chmod -R 775 /usr/local/x-ui/bin 2>/dev/null || true
 
-# 5. Generate X25519 Keys for REALITY
-echo -e "${BLUE}[5/9] Генерация криптографических ключей REALITY...${NC}"
+# Initialize Hardened Log Files & Permissions (660, non-world-writable)
+mkdir -p /var/log/x-ui
+touch /var/log/xray-access.log /var/log/xray-error.log
+chown root:${XUI_GROUP} /var/log/xray-access.log /var/log/xray-error.log 2>/dev/null || true
+chmod 660 /var/log/xray-access.log /var/log/xray-error.log 2>/dev/null || true
+
+# 6. Generate X25519 Keys for REALITY
+echo -e "${BLUE}[6/10] Генерация криптографических ключей REALITY...${NC}"
 XRAY_BIN="/usr/local/x-ui/bin/xray-linux-amd64"
 if [[ ! -f "$XRAY_BIN" ]]; then
     XRAY_BIN=$(which xray 2>/dev/null || true)
@@ -159,8 +214,8 @@ KEYS_OUTPUT=$("$XRAY_BIN" x25519 2>/dev/null || echo -e "Private key: $(openssl 
 REALITY_PRIV_KEY=$(echo "$KEYS_OUTPUT" | grep -i "Private key" | awk '{print $NF}')
 REALITY_PUB_KEY=$(echo "$KEYS_OUTPUT" | grep -i "Public key" | awk '{print $NF}')
 
-# 6. Deploy Modern Showcase Website Template for DOMAIN_WEB
-echo -e "${BLUE}[6/9] Развертывание чистого шаблона веб-сайта AetherCloud...${NC}"
+# 7. Deploy Modern Showcase Website Template for DOMAIN_WEB
+echo -e "${BLUE}[7/10] Развертывание чистого шаблона веб-сайта AetherCloud...${NC}"
 mkdir -p /var/www/html/site
 cat << 'HTMLEOF' > /var/www/html/site/index.html
 <!DOCTYPE html>
@@ -170,6 +225,7 @@ cat << 'HTMLEOF' > /var/www/html/site/index.html
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AetherCloud &mdash; High Performance Infrastructure Solutions</title>
     <meta name="description" content="Next-generation scalable cloud delivery, edge compute and distributed telemetry network.">
+    <meta name="robots" content="noindex, nofollow, noarchive">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -345,14 +401,15 @@ cat << 'HTMLEOF' > /var/www/html/site/index.html
 </html>
 HTMLEOF
 
-# 7. Configure Caddy & Nginx (SNI Pre-read Routing)
-echo -e "${BLUE}[7/9] Настройка Caddy и Nginx Stream SNI Multiplexer...${NC}"
+# 8. Configure Caddy & Nginx (SNI Pre-read Routing & Anti-Scanner Headers)
+echo -e "${BLUE}[8/10] Настройка Caddy и Nginx Stream SNI Multiplexer...${NC}"
 
-# Caddyfile
+# Caddyfile (Hardened with admin off, strict_sni_host, robots.txt, X-Robots-Tag)
 cat << CADEOF > /etc/caddy/Caddyfile
 {
 	https_port 8444
 	http_port 8088
+	admin off
 	servers {
 		protocols h1 h2
 		strict_sni_host
@@ -360,9 +417,14 @@ cat << CADEOF > /etc/caddy/Caddyfile
 }
 
 ${DOMAIN_WEB} {
+	respond /robots.txt "User-agent: *
+Disallow: /
+" 200
+
 	root * /var/www/html/site
 	file_server
 	header {
+		X-Robots-Tag "noindex, nofollow, noarchive"
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		-Via
 		-Server
@@ -371,12 +433,17 @@ ${DOMAIN_WEB} {
 }
 
 ${DOMAIN_PANEL} {
+	respond /robots.txt "User-agent: *
+Disallow: /
+" 200
+
 	handle /${SECRET_SUB_PATH}/* {
 		reverse_proxy 127.0.0.1:2096 {
 			header_up X-Forwarded-Port 443
 		}
 		header {
 			Profile-Update-Interval "1"
+			X-Robots-Tag "noindex, nofollow, noarchive"
 			-Via
 			-Server
 			-Alt-Svc
@@ -388,6 +455,7 @@ ${DOMAIN_PANEL} {
 			header_up X-Forwarded-Port 443
 		}
 		header {
+			X-Robots-Tag "noindex, nofollow, noarchive"
 			-Via
 			-Server
 			-Alt-Svc
@@ -473,16 +541,18 @@ server {
 }
 NGINXEOF
 
-# 8. Configure 3x-ui Database (Settings, Template & Dual Inbounds)
-echo -e "${BLUE}[8/9] Конфигурирование 3x-ui, маршрутизации и защищенных инбаундов...${NC}"
+mkdir -p /etc/nginx/sites-enabled
+ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+
+# 9. Configure 3x-ui Database (Settings, Template, Inbounds & Client Traffics)
+echo -e "${BLUE}[9/10] Конфигурирование 3x-ui, маршрутизации и защищенных инбаундов...${NC}"
 DB_PATH="/etc/x-ui/x-ui.db"
 
-# Update 3x-ui settings in SQLite
+# Update 3x-ui credentials and core settings natively (hashes password with bcrypt)
+/usr/local/x-ui/x-ui setting -username "${ADMIN_USER}" -password "${ADMIN_PASS}" -port 2053 -listenIP 127.0.0.1 -webBasePath "${SECRET_BASE_PATH}" >/dev/null 2>&1 || true
+
+# Update subscription settings in SQLite
 sqlite3 "$DB_PATH" << SQLEOF
-UPDATE users SET username='${ADMIN_USER}', password='${ADMIN_PASS}' WHERE id=1;
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webPort', '2053');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webListen', '127.0.0.1');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webBasePath', '${SECRET_BASE_PATH}');
 INSERT OR REPLACE INTO settings (key, value) VALUES ('subPath', '/${SECRET_SUB_PATH}/');
 INSERT OR REPLACE INTO settings (key, value) VALUES ('subPort', '2096');
 INSERT OR REPLACE INTO settings (key, value) VALUES ('subListen', '127.0.0.1');
@@ -552,7 +622,7 @@ STREAM_SETTINGS_TCP=$(jq -n \
         publicKey: $pub,
         fingerprint: "firefox",
         serverName: $sni,
-        spiderX: "/qxvjQOAF1J1VY2X"
+        spiderX: "/"
       }
     },
     tcpSettings: {
@@ -594,7 +664,7 @@ STREAM_SETTINGS_XHTTP=$(jq -n \
         publicKey: $pub,
         fingerprint: "firefox",
         serverName: $sni,
-        spiderX: "/qxvjQOAF1J1VY2X"
+        spiderX: "/"
       }
     },
     xhttpSettings: {
@@ -610,7 +680,7 @@ CLIENTS_XHTTP=$(jq -n \
 
 INBOUND_SETTINGS_XHTTP=$(jq -n --argjson clients "$CLIENTS_XHTTP" '{ clients: $clients, decryption: "none" }')
 
-# Insert Inbounds into 3x-ui Database
+# Insert Inbounds into 3x-ui Database & populate client_traffics
 sqlite3 "$DB_PATH" << SQLEOF
 DELETE FROM inbounds WHERE tag IN ('in-443-tcp', 'in-443-xhttp');
 
@@ -618,7 +688,7 @@ INSERT INTO inbounds (
     user_id, up, down, total, remark, sub_sort_index, enable, expiry_time,
     listen, port, protocol, settings, stream_settings, tag, sniffing
 ) VALUES (
-    1, 0, 0, 0, 'Amsterdam-TCP', 1, 1, 0,
+    1, 0, 0, 0, 'Stealth-TCP', 1, 1, 0,
     '127.0.0.2', 443, 'vless',
     '${INBOUND_SETTINGS_TCP}',
     '${STREAM_SETTINGS_TCP}',
@@ -630,56 +700,142 @@ INSERT INTO inbounds (
     user_id, up, down, total, remark, sub_sort_index, enable, expiry_time,
     listen, port, protocol, settings, stream_settings, tag, sniffing
 ) VALUES (
-    1, 0, 0, 0, 'Amsterdam-XHTTP', 2, 1, 0,
+    1, 0, 0, 0, 'Stealth-XHTTP', 2, 1, 0,
     '127.0.0.3', 443, 'vless',
     '${INBOUND_SETTINGS_XHTTP}',
     '${STREAM_SETTINGS_XHTTP}',
     'in-443-xhttp',
     '${SNIFFING_JSON}'
 );
+
+DELETE FROM client_traffics WHERE email IN ('client-tcp', 'client-xhttp');
+
+INSERT OR IGNORE INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total)
+SELECT id, 1, 'client-tcp', 0, 0, 0, 0 FROM inbounds WHERE tag = 'in-443-tcp';
+
+INSERT OR IGNORE INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total)
+SELECT id, 1, 'client-xhttp', 0, 0, 0, 0 FROM inbounds WHERE tag = 'in-443-xhttp';
 SQLEOF
 
 # Fix ownership
-chown -R xui:xui /usr/local/x-ui /etc/x-ui 2>/dev/null || true
+chown -R ${XUI_USER}:${XUI_GROUP} /usr/local/x-ui /etc/x-ui 2>/dev/null || true
 chmod -R 775 /usr/local/x-ui/bin 2>/dev/null || true
+chown root:${XUI_GROUP} /var/log/xray-access.log /var/log/xray-error.log 2>/dev/null || true
+chmod 660 /var/log/xray-access.log /var/log/xray-error.log 2>/dev/null || true
 
-# 9. Firewall & SSH Hardening
-echo -e "${BLUE}[9/9] Настройка безопасности, SSH и файрвола (UFW)...${NC}"
+# 10. Firewall, CrowdSec & SSH Hardening
+echo -e "${BLUE}[10/10] Настройка безопасности, SSH и файрвола (UFW)...${NC}"
+
+# Disable X11Forwarding to prevent GUI session sniffing
+mkdir -p /etc/ssh/sshd_config.d/
+cat << SSHEOF > /etc/ssh/sshd_config.d/security.conf
+X11Forwarding no
+SSHEOF
+sed -i "s/^#\?X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config || true
 
 if [[ "$SSH_PORT" != "22" ]]; then
-    mkdir -p /etc/ssh/sshd_config.d/
-    cat << SSHEOF > /etc/ssh/sshd_config.d/custom-port.conf
+    cat << SSHEOF >> /etc/ssh/sshd_config.d/security.conf
 Port ${SSH_PORT}
 SSHEOF
     sed -i "s/^#\?Port .*/Port ${SSH_PORT}/" /etc/ssh/sshd_config || true
 fi
 
-# Setup UFW
+# Verify SSH configuration syntax before applying
+if sshd -t 2>/dev/null; then
+    # Handle systemd socket vs service on modern Ubuntu (22.04 / 24.04)
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl is-active ssh.socket >/dev/null 2>&1; then
+        systemctl restart ssh.socket >/dev/null 2>&1 || true
+    fi
+    systemctl restart sshd >/dev/null 2>&1 || systemctl restart ssh >/dev/null 2>&1 || true
+else
+    echo -e "${YELLOW}[!] Предупреждение: ошибка синтаксиса в sshd_config. Порт SSH сохранён как 22.${NC}"
+    SSH_PORT=22
+fi
+
+# Setup UFW with safety checks
 ufw --force reset >/dev/null 2>&1
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow "${SSH_PORT}/tcp" comment "SSH Port"
+if [[ "$SSH_PORT" != "22" ]]; then
+    # Keep 22 open until user confirms, or allow user port cleanly
+    ufw allow 22/tcp comment "SSH Default Fallback"
+fi
 ufw allow 80/tcp comment "HTTP Port"
 ufw allow 443/tcp comment "HTTPS Multiplexer"
 ufw --force enable
 
-# Restart all services
-systemctl restart sshd || systemctl restart ssh
-systemctl restart caddy
-nginx -t && systemctl restart nginx
+# Restart web and VPN services
+caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 && systemctl restart caddy
+nginx -t >/dev/null 2>&1 && systemctl restart nginx
 systemctl restart x-ui
-systemctl restart fail2ban || true
+systemctl restart fail2ban >/dev/null 2>&1 || true
+systemctl restart crowdsec >/dev/null 2>&1 || true
+systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
 
-# Generate Links
+# Health check services
+echo -e "\n${BLUE}Проверка запуска всех системных служб...${NC}"
+for svc in nginx caddy x-ui; do
+    if systemctl is-active --quiet "$svc"; then
+        echo -e "  * Служба ${BOLD}${svc}${NC}: ${GREEN}работает (active)${NC}"
+    else
+        echo -e "  * Служба ${BOLD}${svc}${NC}: ${RED}внимание, не активна (проверьте: journalctl -u ${svc} -n 20)${NC}"
+    fi
+done
+
+# Generate Keys & Links
 ENCODED_XHTTP_PATH=$(echo "$XHTTP_PATH" | sed 's/\//%2F/g')
-LINK_TCP="vless://${CLIENT_UUID}@${SERVER_IP}:443?security=reality&encryption=none&pbk=${REALITY_PUB_KEY}&fp=firefox&sni=${REALITY_TCP_SNI}&sid=${CLIENT_SHORT_ID}&spx=%2FqxvjQOAF1J1VY2X&flow=xtls-rprx-vision&type=tcp#Stealth-Node-TCP"
-LINK_XHTTP="vless://${CLIENT_UUID}@${SERVER_IP}:443?security=reality&encryption=none&pbk=${REALITY_PUB_KEY}&fp=firefox&sni=${REALITY_XHTTP_SNI}&sid=${CLIENT_SHORT_ID}&spx=%2FqxvjQOAF1J1VY2X&type=xhttp&path=${ENCODED_XHTTP_PATH}&mode=auto#Stealth-Node-XHTTP"
+LINK_TCP="vless://${CLIENT_UUID}@${SERVER_IP}:443?security=reality&encryption=none&pbk=${REALITY_PUB_KEY}&fp=firefox&sni=${REALITY_TCP_SNI}&sid=${CLIENT_SHORT_ID}&spx=%2F&flow=xtls-rprx-vision&type=tcp#Stealth-Node-TCP"
+LINK_XHTTP="vless://${CLIENT_UUID}@${SERVER_IP}:443?security=reality&encryption=none&pbk=${REALITY_PUB_KEY}&fp=firefox&sni=${REALITY_XHTTP_SNI}&sid=${CLIENT_SHORT_ID}&spx=%2F&type=xhttp&path=${ENCODED_XHTTP_PATH}&mode=auto#Stealth-Node-XHTTP"
 
-# --- Finished Output ---
+# Save Credentials and Links to Local File for Easy Retrieval
+CREDENTIALS_FILE="/root/stealth-node-credentials.txt"
+cat << EOF > "$CREDENTIALS_FILE"
+================================================================
+          STEALTH NODE CREDENTIALS & VLESS KEYS
+================================================================
+Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+Server IP: ${SERVER_IP}
+
+[1] SSH ACCESS:
+    Port:     ${SSH_PORT}
+    Command:  ssh -p ${SSH_PORT} root@${SERVER_IP}
+
+[2] 3X-UI MANAGEMENT PANEL:
+    URL:      https://${DOMAIN_PANEL}${SECRET_BASE_PATH}
+    Login:    ${ADMIN_USER}
+    Password: ${ADMIN_PASS}
+
+[3] SHOWCASE WEBSITE:
+    URL:      https://${DOMAIN_WEB}/
+
+[4] VLESS TCP REALITY KEY (HIGH SPEED):
+${LINK_TCP}
+
+[5] VLESS XHTTP REALITY KEY (ANTI-DPI / BYPASS):
+${LINK_XHTTP}
+
+[6] REALITY PARAMETERS:
+    Client UUID: ${CLIENT_UUID}
+    Public Key:  ${REALITY_PUB_KEY}
+    Short ID:    ${CLIENT_SHORT_ID}
+    SpiderX:     /
+    SNI 1 (TCP): ${REALITY_TCP_SNI}
+    SNI 2 (HTTP):${REALITY_XHTTP_SNI}
+================================================================
+EOF
+chmod 600 "$CREDENTIALS_FILE"
+
+# --- Final User-Facing Output ---
 clear
 echo -e "${GREEN}${BOLD}================================================================${NC}"
 echo -e "${GREEN}${BOLD}      УСТАНОВКА И ОПТИМИЗАЦИЯ STEALTH NODE УСПЕШНО ЗАВЕРШЕНА!   ${NC}"
 echo -e "${GREEN}${BOLD}================================================================${NC}\n"
+
+echo -e "${CYAN}${BOLD}💾 ВНИМАНИЕ: ВСЕ ССЫЛКИ, ПАРОЛИ И КЛЮЧИ СОХРАНЕНЫ В ЗАЩИЩЕННЫЙ ФАЙЛ:${NC}"
+echo -e "   Файл:   ${YELLOW}${BOLD}${CREDENTIALS_FILE}${NC}"
+echo -e "   Команда: ${BOLD}cat ${CREDENTIALS_FILE}${NC} (доступен только root, права 600)\n"
 
 echo -e "${YELLOW}ВАЖНО: Добавьте следующие A-записи в DNS у вашего регистратора:${NC}"
 echo -e "  * ${BOLD}${DOMAIN_WEB}${NC}   -->  ${CYAN}${SERVER_IP}${NC}"
@@ -687,18 +843,18 @@ echo -e "  * ${BOLD}${DOMAIN_PANEL}${NC} -->  ${CYAN}${SERVER_IP}${NC}\n"
 
 echo -e "${PURPLE}----------------------------------------------------------------${NC}"
 echo -e "${BOLD}1. Доступ к серверу по SSH:${NC}"
-echo -e "   Команда: ${CYAN}ssh -p ${SSH_PORT} root@${SERVER_IP}${NC}"
-echo -e "   (Дефолтный порт 22 закрыт файрволом для защиты от брутфорса!)\n"
+echo -e "   Команда:  ${CYAN}ssh -p ${SSH_PORT} root@${SERVER_IP}${NC}"
+echo -e "   Порт:     ${BOLD}${SSH_PORT}${NC}\n"
 
 echo -e "${PURPLE}----------------------------------------------------------------${NC}"
-echo -e "${BOLD}2. Доступ к панели управления 3x-ui:${NC}"
-echo -e "   URL:     ${CYAN}https://${DOMAIN_PANEL}${SECRET_BASE_PATH}${NC}"
-echo -e "   Логин:   ${BOLD}${ADMIN_USER}${NC}"
-echo -e "   Пароль:  ${BOLD}${ADMIN_PASS}${NC}\n"
+echo -e "${BOLD}2. Доступ к веб-панели управления 3x-ui:${NC}"
+echo -e "   URL:      ${CYAN}https://${DOMAIN_PANEL}${SECRET_BASE_PATH}${NC}"
+echo -e "   Логин:    ${BOLD}${ADMIN_USER}${NC}"
+echo -e "   Пароль:   ${BOLD}${ADMIN_PASS}${NC}\n"
 
 echo -e "${PURPLE}----------------------------------------------------------------${NC}"
-echo -e "${BOLD}3. Ссылка на веб-сайт прикрытия:${NC}"
-echo -e "   URL:     ${CYAN}https://${DOMAIN_WEB}/${NC}\n"
+echo -e "${BOLD}3. Белый веб-сайт (витрина прикрытия):${NC}"
+echo -e "   URL:      ${CYAN}https://${DOMAIN_WEB}/${NC}\n"
 
 echo -e "${PURPLE}----------------------------------------------------------------${NC}"
 echo -e "${BOLD}4. Основной скоростной ключ (VLESS + TCP + Vision + Reality):${NC}"
@@ -709,10 +865,37 @@ echo -e "${BOLD}5. Резервный анти-DPI ключ (VLESS + XHTTP + Rea
 echo -e "${YELLOW}${LINK_XHTTP}${NC}\n"
 
 echo -e "${PURPLE}----------------------------------------------------------------${NC}"
-echo -e "${BOLD}6. Архитектура и защита:${NC}"
-echo -e "   * Порт:          ${CYAN}443 (Единый внешний L4 SNI-мультиплексор)${NC}"
-echo -e "   * BBR & FQ:      ${GREEN}Включены и ускоряют TCP стек${NC}"
-echo -e "   * Маскировка:    ${CYAN}Apple Cloud (gateway.icloud.com / www.apple.com)${NC}"
-echo -e "   * Обход МТС/DPI: ${GREEN}fp=firefox (ClientHello не блокируется операторами)${NC}"
-echo -e "   * Защита VPS:    ${GREEN}BitTorrent и RU-сегмент заблокированы (без DMCA-абуз)${NC}"
+echo -e "${BOLD}6. Технические параметры подключения Reality:${NC}"
+echo -e "   * Client UUID:   ${CYAN}${CLIENT_UUID}${NC}"
+echo -e "   * Public Key:    ${CYAN}${REALITY_PUB_KEY}${NC}"
+echo -e "   * Short ID:      ${CYAN}${CLIENT_SHORT_ID}${NC}"
+echo -e "   * SpiderX:       ${CYAN}/${NC}"
+echo -e "   * SNI (TCP):     ${CYAN}${REALITY_TCP_SNI}${NC}"
+echo -e "   * SNI (XHTTP):   ${CYAN}${REALITY_XHTTP_SNI}${NC}\n"
+
+echo -e "${PURPLE}----------------------------------------------------------------${NC}"
+echo -e "${BOLD}7. Архитектура и встроенная безопасность:${NC}"
+echo -e "   * Внешний порт:  ${CYAN}443 (L4 SNI Pre-read Multiplexer Nginx)${NC}"
+echo -e "   * BBR & FQ:      ${GREEN}Включены в ядре Linux${NC}"
+echo -e "   * Маскировка:    ${CYAN}Apple Infrastructure (gateway.icloud.com / www.apple.com)${NC}"
+echo -e "   * Обход МТС/DPI: ${GREEN}fp=firefox (без блокировок ClientHello)${NC}"
+echo -e "   * Защита VPS:    ${GREEN}BitTorrent & RU-сегмент в blackhole (без DMCA-абуз)${NC}"
+echo -e "   * Харденинг:     ${GREEN}CrowdSec + Fail2ban + UFW + Xray Logs (660) + Caddy Admin Off${NC}\n"
+
+echo -e "${PURPLE}----------------------------------------------------------------${NC}"
+echo -e "${GREEN}${BOLD}💾 НАПОМИНАНИЕ: Копия всех данных сохранена на сервере:${NC}"
+echo -e "   ${BOLD}cat ${CREDENTIALS_FILE}${NC}"
 echo -e "${GREEN}${BOLD}================================================================${NC}\n"
+
+# Optional QR code display
+if command -v qrencode &>/dev/null; then
+    echo -e "${YELLOW}[?] Сгенерировать QR-код для быстрого импорта на телефон? [y/N]: ${NC}"
+    read -r SHOW_QR
+    if [[ "$SHOW_QR" =~ ^[Yy]$ ]]; then
+        echo -e "\n${BOLD}=== QR-КОД: ОСНОВНОЙ КЛЮЧ (TCP REALITY) ===${NC}\n"
+        qrencode -t ANSIUTF8 "${LINK_TCP}" || true
+        echo -e "\n${BOLD}=== QR-КОД: АНТИ-DPI КЛЮЧ (XHTTP REALITY) ===${NC}\n"
+        qrencode -t ANSIUTF8 "${LINK_XHTTP}" || true
+        echo -e "\n${GREEN}QR-коды сформированы.${NC}\n"
+    fi
+fi
